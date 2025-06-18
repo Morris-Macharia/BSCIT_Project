@@ -1,1 +1,159 @@
+from flask import (
+    Flask, request, jsonify,
+    render_template, Response
+)
+import pandas as pd
+import numpy as np
+import torch, joblib
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score
+)
+from FraudDetectionModel import FraudDetectionANN
+
+app = Flask(__name__)
+
+master_feature_list = joblib.load("master_feature_list.pkl")
+scaler               = joblib.load("scaler.pkl")
+
+# Determine which numeric columns the scaler was trained on
+if hasattr(scaler, "feature_names_in_"):
+    numeric_features = list(scaler.feature_names_in_)
+else:
+    # fallback: list your original 17 numeric columns
+    numeric_features = [
+        "months_as_customer", "age", "policy_deductable",
+        "policy_annual_premium", "umbrella_limit", "capital-gains",
+        "capital-loss", "incident_hour_of_the_day",
+        "number_of_vehicles_involved", "bodily_injuries", "witnesses",
+        "injury_claim", "property_claim", "vehicle_claim",
+        "days_since_incident", "policy_duration"
+    ]
+
+# Initialize model
+input_dim = len(master_feature_list)
+model     = FraudDetectionANN(input_dim)
+model.load_state_dict(torch.load(
+    "FraudDetectionModel.pth", map_location="cpu"
+))
+model.eval()
+
+# ─── Preprocessing ─────────────────────────────────────────────────────────────
+def preprocess_df(df: pd.DataFrame) -> torch.Tensor:
+    # 1) reindex to exactly training cols
+    df = df.reindex(columns=master_feature_list, fill_value=0)
+    # 2) coerce all to numeric and fill NaNs
+    df = df.apply(pd.to_numeric, errors="coerce").fillna(0)
+    # 3) scale only the numeric subset
+    arr_num    = df[numeric_features].to_numpy(dtype=np.float32)
+    arr_scaled = scaler.transform(arr_num)
+    df[numeric_features] = arr_scaled
+    # 4) final numpy array & torch tensor
+    X_np = df.to_numpy(dtype=np.float32)
+    return torch.from_numpy(X_np)
+
+# ─── Routes ────────────────────────────────────────────────────────────────────
+@app.route("/")
+def home():
+    return render_template("UI.html")
+
+
+@app.route("/upload_csv", methods=["POST"])
+def upload_csv():
+    """
+    Expects: multipart/form-data with 'file' = CSV
+    Returns JSON with:
+      - records: [ {..., fraud_probability: float, prediction: str}, … ]
+      - metrics: { accuracy: %, precision: %, recall: %, f1: %, roc_auc: % }
+      - summary: { total: int, fraudulent: int, legitimate: int }
+    """
+    try:
+        f = request.files.get("file", None)
+        if not f or not f.filename:
+            return jsonify({"error": "No CSV file provided"}), 400
+
+        # 1) Load & preprocess
+        df = pd.read_csv(f)
+        X  = preprocess_df(df)
+
+        # 2) Inference
+        with torch.no_grad():
+            proba = torch.sigmoid(model(X)).numpy().ravel()
+        preds = ["Fraudulent" if p >= 0.5 else "Legitimate" for p in proba]
+
+        # 3) Build results
+        results = df.copy()
+        results["fraud_probability"] = np.round(proba, 2)
+        results["prediction"]        = preds
+
+        # 4) Compute metrics if we have ground truth
+        metrics = {}
+        if "fraud_reported" in df.columns:
+            # map Y/N → 1/0
+            y_true = df["fraud_reported"].map({"Y": 1, "N": 0}).to_numpy()
+            y_pred = np.array(preds) == "Fraudulent"
+            raw = {
+                "accuracy":  accuracy_score(y_true, y_pred),
+                "precision": precision_score(y_true, y_pred, zero_division=0),
+                "recall":    recall_score(y_true, y_pred),
+                "f1":        f1_score(y_true, y_pred),
+                "roc_auc":   roc_auc_score(y_true, proba)
+            }
+            # convert to percentages
+            metrics = {k: round(v * 100, 2) for k, v in raw.items()}
+
+        # 5) Summary counts
+        total       = len(results)
+        fraud_count = results["prediction"].value_counts().get("Fraudulent", 0)
+        legit_count = total - fraud_count
+        summary     = {
+            "total":      total,
+            "fraudulent": int(fraud_count),
+            "legitimate": int(legit_count)
+        }
+
+        # 6) Replace NaN → None for JSON
+        results = results.where(pd.notnull(results), None)
+
+        return jsonify({
+            "records": results.to_dict(orient="records"),
+            "metrics": metrics,
+            "summary": summary
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/download_results", methods=["POST"])
+def download_results():
+    """
+    Expects JSON payload: { "records": [ {...}, {...}, … ] }
+    Returns a CSV attachment of those records.
+    """
+    try:
+        data = request.get_json().get("records", [])
+        if not data:
+            return jsonify({"error": "No records provided"}), 400
+
+        df  = pd.DataFrame(data)
+        csv = df.to_csv(index=False)
+
+        return Response(
+            csv,
+            mimetype="text/csv",
+            headers={
+                "Content-Disposition":
+                    "attachment; filename=fraud_predictions.csv"
+            }
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
 
